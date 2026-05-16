@@ -1,12 +1,17 @@
 import os
 import re
 import ssl
+import csv
+from io import BytesIO, StringIO
 from contextlib import contextmanager
 from typing import Any
 from urllib.parse import parse_qsl, quote, unquote, urlsplit, urlunsplit
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
 import pg8000
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 APP_TITLE = "SyJDWH Data API"
 APP_VERSION = "1.0.0"
@@ -179,6 +184,20 @@ def rows_to_dicts(cur: Any, rows: list[tuple[Any, ...]]) -> list[dict[str, Any]]
     return [dict(zip(columns, row)) for row in rows]
 
 
+def fetch_table_rows(cur: Any, table_name: str, limit: int | None = None) -> tuple[list[str], list[tuple[Any, ...]]]:
+    quoted_table = f'"{table_name}"'
+    if limit is None:
+        query = f"SELECT * FROM {quoted_table}"
+        cur.execute(query)
+    else:
+        query = f"SELECT * FROM {quoted_table} LIMIT %s"
+        cur.execute(query, (limit,))
+
+    rows = cur.fetchall()
+    columns = [desc[0] for desc in cur.description]
+    return columns, rows
+
+
 def fetch_tables() -> list[dict[str, Any]]:
     with db_cursor() as cur:
         cur.execute(
@@ -191,6 +210,12 @@ def fetch_tables() -> list[dict[str, Any]]:
         )
         rows = cur.fetchall()
         return rows_to_dicts(cur, rows)
+
+
+@app.get("/health", tags=["health"])
+def health() -> dict[str, Any]:
+    """Simple liveness check — no DB required."""
+    return {"status": "ok", "version": APP_VERSION}
 
 
 @app.get("/health/db", tags=["health"])
@@ -259,3 +284,67 @@ def get_table_data(
         raise
     except Exception as exc:  # pragma: no cover
         raise HTTPException(status_code=503, detail=f"Error consultando datos: {exc}") from exc
+
+
+@app.get("/tables/{table_name}/download/csv", tags=["data"])
+def download_table_csv(
+    table_name: str,
+    limit: int | None = Query(default=None, ge=1, description="Limite opcional de filas"),
+) -> StreamingResponse:
+    """Download any public table as CSV."""
+    assert_safe_table_name(table_name)
+
+    try:
+        with db_cursor() as cur:
+            if not table_exists(cur, table_name):
+                raise HTTPException(status_code=404, detail="Tabla no encontrada")
+
+            columns, rows = fetch_table_rows(cur, table_name, limit=limit)
+
+        csv_buffer = StringIO()
+        writer = csv.writer(csv_buffer)
+        writer.writerow(columns)
+        writer.writerows(rows)
+
+        payload = BytesIO(csv_buffer.getvalue().encode("utf-8"))
+        filename = f"{table_name}.csv"
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        return StreamingResponse(payload, media_type="text/csv; charset=utf-8", headers=headers)
+    except HTTPException:
+        raise
+    except Exception as exc:  # pragma: no cover
+        raise HTTPException(status_code=503, detail=f"Error descargando CSV: {exc}") from exc
+
+
+@app.get("/tables/{table_name}/download/parquet", tags=["data"])
+def download_table_parquet(
+    table_name: str,
+    limit: int | None = Query(default=None, ge=1, description="Limite opcional de filas"),
+) -> StreamingResponse:
+    """Download any public table as Parquet."""
+    assert_safe_table_name(table_name)
+
+    try:
+        with db_cursor() as cur:
+            if not table_exists(cur, table_name):
+                raise HTTPException(status_code=404, detail="Tabla no encontrada")
+
+            columns, rows = fetch_table_rows(cur, table_name, limit=limit)
+
+        data = {column: [row[idx] for row in rows] for idx, column in enumerate(columns)}
+        table = pa.table(data)
+        parquet_buffer = BytesIO()
+        pq.write_table(table, parquet_buffer)
+        parquet_buffer.seek(0)
+
+        filename = f"{table_name}.parquet"
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        return StreamingResponse(
+            parquet_buffer,
+            media_type="application/x-parquet",
+            headers=headers,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:  # pragma: no cover
+        raise HTTPException(status_code=503, detail=f"Error descargando Parquet: {exc}") from exc
