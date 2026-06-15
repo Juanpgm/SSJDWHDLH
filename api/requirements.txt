@@ -1,3 +1,5 @@
 fastapi==0.115.12
 uvicorn==0.34.2
 pg8000==1.31.2
+pyarrow>=18.0.0
+firebase-admin>=7.4.0
